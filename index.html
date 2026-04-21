@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>海运/空运决策模型（最小版）</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f7f7f9; }
+    .wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+    h2 { margin-top: 0; font-size: 18px; }
+    .row { display: grid; grid-template-columns: 130px 1fr; gap: 8px; margin-bottom: 10px; align-items: center; }
+    input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; width: 100%; box-sizing: border-box; }
+    button { padding: 10px 14px; border: none; border-radius: 8px; cursor: pointer; background: #1677ff; color: #fff; }
+    .muted { color: #666; font-size: 12px; }
+    .ok { color: #1f8f2e; }
+    .warn { color: #d46b08; }
+    .bad { color: #cf1322; }
+    pre { background: #f4f6f8; padding: 10px; border-radius: 8px; overflow: auto; font-size: 12px; }
+    ul { margin: 6px 0 0 18px; }
+  </style>
+</head>
+<body>
+  <h1>运输决策模型（可运行最小版）</h1>
+  <p class="muted">规则：计费重=max(实重,体积重)，体积重=长*宽*高/6000；12kg以下强制空运；运费不得超过货值50%。</p>
+
+  <div class="wrap">
+    <div class="card">
+      <h2>输入参数</h2>
+
+      <div class="row"><label>长(cm)</label><input id="lengthCm" type="number" value="40" min="1"></div>
+      <div class="row"><label>宽(cm)</label><input id="widthCm" type="number" value="30" min="1"></div>
+      <div class="row"><label>高(cm)</label><input id="heightCm" type="number" value="20" min="1"></div>
+      <div class="row"><label>实重(kg)</label><input id="actualWeightKg" type="number" value="18" min="0.01" step="0.1"></div>
+      <div class="row"><label>货值(元)</label><input id="cargoValueCny" type="number" value="5000" min="0.01"></div>
+
+      <div class="row">
+        <label>品类</label>
+        <select id="category">
+          <option value="general">普货</option>
+          <option value="steel_aluminum">钢铁铝</option>
+          <option value="textile">纺织品</option>
+        </select>
+      </div>
+
+      <div class="row"><label>品名个数</label><input id="productNameCount" type="number" value="3" min="0"></div>
+      <div class="row"><label>是否UL/RU</label><select id="hasULRU"><option value="false">否</option><option value="true">是</option></select></div>
+      <div class="row"><label>是否退运</label><select id="isReturnCase"><option value="false">否</option><option value="true">是</option></select></div>
+      <div class="row"><label>税率(0~1)</label><input id="taxRate" type="number" value="0.2" min="0" max="1" step="0.01"></div>
+
+      <button id="calcBtn">计算决策</button>
+    </div>
+
+    <div class="card">
+      <h2>结果输出</h2>
+      <div id="result">点击“计算决策”后显示结果</div>
+    </div>
+  </div>
+
+  <script>
+    // ====== pricing_rules.json（内嵌最小可运行版）======
+    const pricingRules = {
+      global: {
+        volumeDivisor: 6000,
+        maxFreightRatio: 0.5,
+        mandatoryAirBelowKg: 12
+      },
+      transportModes: {
+        sea: { ratePerKg: 20 },
+        air: { ratePerKg: 60 }
+      },
+      fees: {
+        customsDeclaration: 150,            // 报关费/票
+        overweightThresholdKg: 30,          // >30kg收超重费
+        overweightPerKg: 1,                 // 超重费
+        categoryPerKg: {
+          steel_aluminum: 1.5,
+          textile: 0.5,
+          general: 0
+        },
+        ulruPerKg: 1,                       // UL/RU +1/kg
+        returnPerKg: 1,                     // 退运 +1/kg
+        productNameOver5PerItem: 35         // 品名超5个，每个+35
+      }
+    };
+
+    // ====== 类型/校验（简化版 parseDecisionInput / parseDecisionResult）======
+    function parseDecisionInput(raw) {
+      const n = (v) => Number(v);
+      const input = {
+        lengthCm: n(raw.lengthCm),
+        widthCm: n(raw.widthCm),
+        heightCm: n(raw.heightCm),
+        actualWeightKg: n(raw.actualWeightKg),
+        cargoValueCny: n(raw.cargoValueCny),
+        category: raw.category || "general",
+        productNameCount: n(raw.productNameCount || 0),
+        hasULRU: raw.hasULRU === true || raw.hasULRU === "true",
+        isReturnCase: raw.isReturnCase === true || raw.isReturnCase === "true",
+        taxRate: n(raw.taxRate || 0)
+      };
+
+      const requiredPositive = ["lengthCm", "widthCm", "heightCm", "actualWeightKg", "cargoValueCny"];
+      for (const k of requiredPositive) {
+        if (!Number.isFinite(input[k]) || input[k] <= 0) {
+          throw new Error(`输入错误：${k} 必须大于0`);
+        }
+      }
+      if (input.productNameCount < 0) throw new Error("输入错误：productNameCount 不能小于0");
+      if (input.taxRate < 0 || input.taxRate > 1) throw new Error("输入错误：taxRate 必须在 0~1");
+      return input;
+    }
+
+    function parseDecisionResult(result) {
+      if (!result || !result.recommendedMode || !result.costs) {
+        throw new Error("结果结构不合法");
+      }
+      return result;
+    }
+
+    // ====== calculateDecision(input) ======
+    function calculateModeCost(input, mode, rules) {
+      const volumetricWeight = (input.lengthCm * input.widthCm * input.heightCm) / rules.global.volumeDivisor;
+      const chargeableWeight = Math.max(input.actualWeightKg, volumetricWeight);
+
+      const rate = rules.transportModes[mode].ratePerKg;
+      const baseFreight = chargeableWeight * rate;
+
+      const fixedFees = rules.fees.customsDeclaration;
+
+      let variableFees = 0;
+      // 超重费
+      if (chargeableWeight > rules.fees.overweightThresholdKg) {
+        variableFees += chargeableWeight * rules.fees.overweightPerKg;
+      }
+      // 品类附加
+      variableFees += chargeableWeight * (rules.fees.categoryPerKg[input.category] || 0);
+      // UL/RU
+      if (input.hasULRU) variableFees += chargeableWeight * rules.fees.ulruPerKg;
+      // 退运
+      if (input.isReturnCase) variableFees += chargeableWeight * rules.fees.returnPerKg;
+      // 品名超5
+      if (input.productNameCount > 5) {
+        variableFees += (input.productNameCount - 5) * rules.fees.productNameOver5PerItem;
+      }
+
+      const total = baseFreight + fixedFees + variableFees;
+      const ratio = total / input.cargoValueCny;
+      const valid = ratio <= rules.global.maxFreightRatio;
+
+      return {
+        mode,
+        actualWeightKg: round2(input.actualWeightKg),
+        volumetricWeightKg: round2(volumetricWeight),
+        chargeableWeightKg: round2(chargeableWeight),
+        baseFreight: round2(baseFreight),
+        fixedFees: round2(fixedFees),
+        variableFees: round2(variableFees),
+        totalLogisticsCost: round2(total),
+        freightRatio: round2(ratio),
+        validByRatio: valid
+      };
+    }
+
+    function calculateDecision(input, rules) {
+      const sea = calculateModeCost(input, "sea", rules);
+      const air = calculateModeCost(input, "air", rules);
+
+      let recommendedMode = "air";
+      const reason = [];
+      const alerts = [];
+      const suggestions = [];
+
+      // 硬规则：12kg以下走空运
+      if (input.actualWeightKg < rules.global.mandatoryAirBelowKg) {
+        recommendedMode = "air";
+        reason.push(`硬规则触发：实重 ${input.actualWeightKg}kg < ${rules.global.mandatoryAirBelowKg}kg，优先空运`);
+      } else {
+        recommendedMode = sea.totalLogisticsCost <= air.totalLogisticsCost ? "sea" : "air";
+        reason.push(`成本优先：${recommendedMode === "sea" ? "海运" : "空运"}总成本更低`);
+      }
+
+      // 50%红线合规覆盖
+      if (!air.validByRatio && sea.validByRatio) {
+        recommendedMode = "sea";
+        alerts.push("空运超过50%红线，强制切换海运");
+      } else if (!air.validByRatio && !sea.validByRatio) {
+        recommendedMode = "none";
+        alerts.push("海运与空运均超过50%红线，建议暂停出货或调整定价/包装");
+      }
+
+      // break-even（空运）
+      const minCargoValueForAir = round2(air.totalLogisticsCost / rules.global.maxFreightRatio);
+
+      // 简化建议
+      if (input.productNameCount > 5) suggestions.push("可合并申报品名，减少“品名超5个”附加费");
+      if (input.lengthCm > 120 || input.widthCm > 120 || input.heightCm > 120) {
+        suggestions.push("建议优化包装尺寸，避免超长附加费（若你后续启用该规则）");
+      }
+
+      return {
+        recommendedMode,
+        reason,
+        costs: { sea, air },
+        alerts,
+        optimizationSuggestions: suggestions,
+        breakEven: {
+          minCargoValueForAirBy50Rule: minCargoValueForAir
+        }
+      };
+    }
+
+    function round2(n) {
+      return Math.round(n * 100) / 100;
+    }
+
+    function renderResult(result) {
+      const modeText = result.recommendedMode === "sea"
+        ? "海运"
+        : result.recommendedMode === "air"
+          ? "空运"
+          : "不可行（均超50%红线）";
+
+      const sea = result.costs.sea;
+      const air = result.costs.air;
+
+      const ratioClass = (v) => v <= 0.5 ? "ok" : "bad";
+
+      return `
+        <h3>推荐：<span>${modeText}</span></h3>
+
+        <p><strong>决策原因：</strong></p>
+        <ul>${result.reason.map(r => `<li>${r}</li>`).join("")}</ul>
+
+        <hr />
+
+        <h4>海运成本</h4>
+        <ul>
+          <li>计费重：${sea.chargeableWeightKg} kg（实重 ${sea.actualWeightKg} / 体积重 ${sea.volumetricWeightKg}）</li>
+          <li>基础运费：${sea.baseFreight} 元</li>
+          <li>固定费用：${sea.fixedFees} 元</li>
+          <li>附加费用：${sea.variableFees} 元</li>
+          <li><strong>总成本：${sea.totalLogisticsCost} 元</strong></li>
+          <li class="${ratioClass(sea.freightRatio)}">运费占货值：${(sea.freightRatio * 100).toFixed(2)}%</li>
+        </ul>
+
+        <h4>空运成本</h4>
+        <ul>
+          <li>计费重：${air.chargeableWeightKg} kg（实重 ${air.actualWeightKg} / 体积重 ${air.volumetricWeightKg}）</li>
+          <li>基础运费：${air.baseFreight} 元</li>
+          <li>固定费用：${air.fixedFees} 元</li>
+          <li>附加费用：${air.variableFees} 元</li>
+          <li><strong>总成本：${air.totalLogisticsCost} 元</strong></li>
+          <li class="${ratioClass(air.freightRatio)}">运费占货值：${(air.freightRatio * 100).toFixed(2)}%</li>
+        </ul>
+
+        <hr />
+
+        <p><strong>临界值：</strong>空运满足50%红线所需最低货值 ≈ ${result.breakEven.minCargoValueForAirBy50Rule} 元</p>
+
+        ${result.alerts.length ? `<p class="warn"><strong>预警：</strong></p><ul>${result.alerts.map(a => `<li>${a}</li>`).join("")}</ul>` : ""}
+        ${result.optimizationSuggestions.length ? `<p><strong>优化建议：</strong></p><ul>${result.optimizationSuggestions.map(s => `<li>${s}</li>`).join("")}</ul>` : ""}
+
+        <details style="margin-top:10px;">
+          <summary>查看原始JSON结果</summary>
+          <pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre>
+        </details>
+      `;
+    }
+
+    function escapeHtml(str) {
+      return str
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    document.getElementById("calcBtn").addEventListener("click", () => {
+      try {
+        const raw = {
+          lengthCm: document.getElementById("lengthCm").value,
+          widthCm: document.getElementById("widthCm").value,
+          heightCm: document.getElementById("heightCm").value,
+          actualWeightKg: document.getElementById("actualWeightKg").value,
+          cargoValueCny: document.getElementById("cargoValueCny").value,
+          category: document.getElementById("category").value,
+          productNameCount: document.getElementById("productNameCount").value,
+          hasULRU: document.getElementById("hasULRU").value,
+          isReturnCase: document.getElementById("isReturnCase").value,
+          taxRate: document.getElementById("taxRate").value
+        };
+
+        const input = parseDecisionInput(raw);
+        const rawResult = calculateDecision(input, pricingRules);
+        const result = parseDecisionResult(rawResult);
+
+        document.getElementById("result").innerHTML = renderResult(result);
+      } catch (e) {
+        document.getElementById("result").innerHTML = `<p class="bad">错误：${e.message}</p>`;
+      }
+    });
+  </script>
+</body>
+</html>
